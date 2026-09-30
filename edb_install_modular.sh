@@ -31,6 +31,7 @@
 #   ./edb_install_modular.sh            # 進入互動面板
 #   ./edb_install_modular.sh --run-all  # 非互動，依序跑完全部步驟
 #   ./edb_install_modular.sh 5.7        # 非互動，只跑單一步驟後結束
+#   ./edb_install_modular.sh 5          # 非互動，整章（5/6/7）依序執行後結束
 #   ./edb_install_modular.sh --check    # 非互動，只做當下值檢查
 #
 set -uo pipefail
@@ -1060,8 +1061,20 @@ run_all() {
 run_chapter() {
   local chapter="$1" id
   for id in "${STEP_ORDER[@]}"; do
-    [ "${STEP_CHAPTER[$id]}" = "$chapter" ] && { run_step "$id" || return 1; }
+    [ "${STEP_CHAPTER[$id]}" = "$chapter" ] || continue
+    run_step "$id" || { echo -e "${C_RED}[CRIT]${C_RST} 在步驟 $id 中止，本章未繼續往下執行。"; return 1; }
   done
+  return 0
+}
+
+# run_chapter_num：用章節編號（5/6/7）執行整章，面板與命令列共用
+run_chapter_num() {
+  case "$1" in
+    5) run_chapter "五、作業系統設定" ;;
+    6) run_chapter "六、EDB 安裝作業" ;;
+    7) run_chapter "七、EDB 安裝後的 OS 設定" ;;
+    *) return 1 ;;
+  esac
 }
 
 show_scope() {
@@ -1811,16 +1824,11 @@ interactive_panel() {
     echo
     echo "輸入代號執行單一步驟，或 [5/6/7]整章執行 [A]全部執行 [S]適用範圍 [T]參數對比 [P]參數設定 [F]最終成果 [V]當下值檢查 [C]設定檔路徑 [H]說明 [Q]離開"
     read -erp "> " choice
+    choice="${choice//-/.}"  # 5-1 視同 5.1
     case "$choice" in
       [qQ]) break ;;
       [aA]|all) run_all ;;
-      5|6|7)
-        case "$choice" in
-          5) run_chapter "五、作業系統設定" ;;
-          6) run_chapter "六、EDB 安裝作業" ;;
-          7) run_chapter "七、EDB 安裝後的 OS 設定" ;;
-        esac
-        ;;
+      5|6|7) run_chapter_num "$choice" ;;
       [sS]|scope) show_scope ;;
       [tT]|table) show_param_table ;;
       [pP]) edit_params ;;
@@ -1856,14 +1864,17 @@ case "${1:-}" in
   --check)
     show_current_values
     ;;
+  5|6|7)
+    run_chapter_num "$1"
+    ;;
   "")
     interactive_panel
     ;;
   *)
-    if [ -n "${STEP_FUNC[$1]:-}" ]; then
-      run_step "$1"
+    if [ -n "${STEP_FUNC[${1//-/.}]:-}" ]; then
+      run_step "${1//-/.}"
     else
-      echo "用法：$0 [--run-all | --check | 步驟代號，例如 5.7]"
+      echo "用法：$0 [--run-all | --check | 章節編號 5/6/7 | 步驟代號，例如 5.7]"
       exit 1
     fi
     ;;

@@ -23,6 +23,7 @@ EDB Postgres Advanced Server 標準安裝程序的模組化版本。把原本線
 ./edb_install_modular.sh            # 進入互動面板
 ./edb_install_modular.sh --run-all  # 非互動，依序跑完全部步驟（五 → 六 → 七）
 ./edb_install_modular.sh 5.7        # 非互動，只跑單一步驟後結束（步驟代號見下表）
+./edb_install_modular.sh 5          # 非互動，整章（5/6/7）依序執行後結束
 ./edb_install_modular.sh --check    # 非互動，只做當下值檢查
 ```
 
