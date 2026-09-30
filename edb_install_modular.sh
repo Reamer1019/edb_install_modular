@@ -31,6 +31,7 @@
 #   ./edb_install_modular.sh            # 進入互動面板
 #   ./edb_install_modular.sh --run-all  # 非互動，依序跑完全部步驟
 #   ./edb_install_modular.sh 5.7        # 非互動，只跑單一步驟後結束
+#   ./edb_install_modular.sh --check    # 非互動，只做當下值檢查
 #
 set -uo pipefail
 
@@ -39,7 +40,11 @@ set -uo pipefail
 # 設定檔，之後每次都讀同一份，改設定不用改程式碼）
 # ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/edb_install.conf"
+CONFIG_FILE="$SCRIPT_DIR/edb_install_modular.conf"
+# 舊版設定檔名為 edb_install.conf，新檔不存在時直接沿用舊檔改名，設定不會遺失
+if [ ! -f "$CONFIG_FILE" ] && [ -f "$SCRIPT_DIR/edb_install.conf" ]; then
+  mv "$SCRIPT_DIR/edb_install.conf" "$CONFIG_FILE"
+fi
 STATE_FILE="$SCRIPT_DIR/.edb_install_state"
 LOG_DIR="$SCRIPT_DIR/edb_install_logs"
 mkdir -p "$LOG_DIR"
@@ -1069,7 +1074,7 @@ show_scope() {
 - 部署架構：單機安裝，不涵蓋 HA / Streaming Replication / 叢集部署的
   額外設定。SSH 金鑰交換段落僅處理 standby/witness 主機的免密碼連線，
   不含 repmgr/Patroni 等 HA 工具設定。
-- EDB 版本：需先在設定檔（edb_install.conf）寫好要安裝的版本。
+- EDB 版本：需先在設定檔（edb_install_modular.conf）寫好要安裝的版本。
 - 磁碟配置：假設機器上除了系統碟，其餘實體硬碟均為資料庫用途。若使用
   LVM 且邏輯磁區橫跨多個實體硬碟，磁碟偵測邏輯未涵蓋此情境。
 - 網路/防火牆：全開，需要自己依實際需求調整。
@@ -1321,6 +1326,237 @@ show_final_summary() {
 }
 
 # ════════════════════════════════════════════════════════════
+# 當下值檢查（[V] / --check）
+# 跟 show_final_summary 不同：不看步驟有沒有跑過，一律直接去系統讀「此刻」
+# 的實際值，並跟本腳本的目標值比對。查不到的項目（檔案不存在、服務或資料庫
+# 未啟動……）標示為「未建立」或「無法查詢」，不中斷檢查。
+# ════════════════════════════════════════════════════════════
+
+# cv_row：印一列檢查結果
+# $1=項目 $2=當下值（空字串＝未建立；以「（」開頭＝無法查詢的說明）
+# $3=目標值（空字串＝只顯示、不比對） $4=（選填）正規表示式，多種值都算正確時使用
+cv_row() {
+  local label="$1" cur="$2" tgt="$3" re="${4:-}" mark
+  if [ -z "$cur" ]; then
+    cur="未建立"; mark="${C_YEL}未建立${C_RST}"; CV_NONE=$((CV_NONE+1))
+  elif [[ "$cur" == （* ]]; then
+    mark="${C_YEL}無法查詢${C_RST}"; CV_NONE=$((CV_NONE+1))
+  elif [ -z "$tgt" ]; then
+    mark="—"
+  elif [ "$cur" = "$tgt" ] || { [ -n "$re" ] && [[ "$cur" =~ $re ]]; }; then
+    mark="${C_GRN}一致${C_RST}"; CV_OK=$((CV_OK+1))
+  else
+    mark="${C_RED}不一致${C_RST}"; CV_DIFF=$((CV_DIFF+1))
+  fi
+  printf "  %-30s = %-30s 目標：%-20s [%b]\n" "$label" "$cur" "${tgt:-—}" "$mark"
+}
+
+# limits.d 檔案裡 enterprisedb 某一項的 soft/hard 值　$1=nofile|nproc|core
+cv_limits_file() {
+  local f=/etc/security/limits.d/80-edb-postgres.conf
+  [ -f "$f" ] || return 0
+  awk -v i="$1" '$1=="enterprisedb" && $3==i {v[$2]=$4} END{if (v["soft"] v["hard"] != "") print v["soft"]"/"v["hard"]}' "$f"
+}
+
+# 執行中程序實際套用的 limit（soft/hard）　$1=PID $2=/proc/PID/limits 的欄位名稱
+cv_proc_limit() {
+  awk -v k="$2" 'index($0,k)==1 {split(substr($0,length(k)+1),a," "); print a[1]"/"a[2]}' \
+    "/proc/$1/limits" 2>/dev/null
+}
+
+# postgresql.auto.conf 裡某個 GUC 最後一次出現的值（去掉引號）
+cv_autoconf() {
+  grep -E "^[[:space:]]*$1[[:space:]]*=" "${NEW_PGDATA}/postgresql.auto.conf" 2>/dev/null | tail -n1 |
+    sed -E "s/^[^=]*=[[:space:]]*//; s/^'//; s/'[[:space:]]*$//"
+}
+
+# 以 enterprisedb 身分對執行中的資料庫下查詢，連不上就回傳空字串
+cv_psql() {
+  timeout 10 runuser -u enterprisedb -- "${PG_BINDIR}/psql" -X -A -t -q -p "$PORT" -d postgres -c "$1" 2>/dev/null
+}
+
+show_current_values() {
+  require_root || return 1
+  compute_ulimits
+  CV_OK=0; CV_DIFF=0; CV_NONE=0
+  local v k f dev rota want root_src root_dev pm_pid="" db_ok=0 row name val pend
+  local -A LIVE PEND
+  local GUC_KEYS=(listen_addresses port shared_buffers max_connections max_worker_processes
+    autovacuum_worker_slots max_files_per_process max_prepared_transactions max_wal_senders
+    max_replication_slots huge_pages shared_preload_libraries log_directory logging_collector)
+  local -A GUC_TGT=(
+    [listen_addresses]="$LISTEN_ADDRESSES" [port]="$PORT" [shared_buffers]="$SHARED_BUFFERS"
+    [max_connections]="$MAX_CONNECTIONS" [max_worker_processes]="$MAX_WORKER_PROCESSES"
+    [autovacuum_worker_slots]="$AUTOVACUUM_WORKER_SLOTS" [max_files_per_process]="$MAX_FILES_PER_PROCESS"
+    [max_prepared_transactions]="$MAX_PREPARED_TRANSACTIONS" [max_wal_senders]="$MAX_WAL_SENDERS"
+    [max_replication_slots]="$MAX_REPLICATION_SLOTS" [huge_pages]="$HUGE_PAGES"
+    [shared_preload_libraries]="$SHARED_PRELOAD_LIBRARIES" [log_directory]="$NEW_PGLOG"
+    [logging_collector]="on"
+  )
+
+  if [ -f "${NEW_PGDATA}/postmaster.pid" ]; then
+    pm_pid=$(head -n1 "${NEW_PGDATA}/postmaster.pid" 2>/dev/null)
+    kill -0 "$pm_pid" 2>/dev/null || pm_pid=""
+  fi
+  if [ -n "$pm_pid" ] && [ -x "${PG_BINDIR}/psql" ]; then
+    local in_list; in_list=$(printf "'%s'," "${GUC_KEYS[@]}"); in_list="${in_list%,}"
+    while IFS='|' read -r name val pend; do
+      [ -n "$name" ] || continue
+      LIVE[$name]="$val"; PEND[$name]="$pend"; db_ok=1
+    done < <(cv_psql "SELECT name, current_setting(name), pending_restart FROM pg_settings WHERE name IN (${in_list})")
+  fi
+
+  {
+  echo "======================================================"
+  echo " 當下值檢查 — $(hostname)  $(date '+%Y-%m-%d %H:%M:%S')"
+  echo " 不論步驟是否執行過，一律讀取系統此刻的實際值並與目標值比對"
+  echo "======================================================"
+
+  echo "[SELinux]　來源：getenforce、/etc/selinux/config"
+  cv_row "SELinux（執行中）" "$(getenforce 2>/dev/null)" "Disabled" '^(Disabled|Permissive)$'
+  cv_row "SELINUX=（開機設定）" "$(awk -F= '/^SELINUX=/{print $2}' /etc/selinux/config 2>/dev/null)" "disabled"
+  echo "  ※ setenforce 0 之後、重開機之前會顯示 Permissive，視為一致"
+  echo
+
+  echo "[防火牆]　來源：firewall-cmd"
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    v=$(firewall-cmd --get-default-zone 2>/dev/null)
+  else
+    v="（firewalld 未執行）"
+  fi
+  cv_row "firewalld 預設 zone" "$v" "trusted"
+  echo
+
+  echo "[ulimit]　來源：/etc/security/limits.d/80-edb-postgres.conf；執行中值來自 /proc/<postmaster PID>/limits"
+  cv_row "nofile soft/hard（設定檔）" "$(cv_limits_file nofile)" "${NOFILE}/${NOFILE}"
+  cv_row "nproc soft/hard（設定檔）" "$(cv_limits_file nproc)" "${NPROC}/${NPROC}"
+  cv_row "core soft/hard（設定檔）" "$(cv_limits_file core)" "unlimited/unlimited"
+  if [ -n "$pm_pid" ]; then
+    cv_row "nofile（postmaster 執行中）" "$(cv_proc_limit "$pm_pid" 'Max open files')" "${NOFILE}/${NOFILE}"
+    cv_row "nproc（postmaster 執行中）" "$(cv_proc_limit "$pm_pid" 'Max processes')" "${NPROC}/${NPROC}"
+    cv_row "core（postmaster 執行中）" "$(cv_proc_limit "$pm_pid" 'Max core file size')" "unlimited/unlimited"
+  else
+    cv_row "postmaster 執行中的 limit" "（資料庫未啟動）" ""
+  fi
+  echo "  ※ 以 systemctl 啟動時，實際生效的是 unit file 的 LimitNOFILE/LimitNPROC/LimitCORE（見 [systemd]）"
+  echo
+
+  echo "[sysctl]　來源：sysctl -n（設定檔 /etc/sysctl.d/80-edb-postgres.conf）"
+  cv_row "kernel.core_pattern" "$(sysctl -n kernel.core_pattern 2>/dev/null)" "/var/coredump/core-%e-%p-%t"
+  cv_row "vm.overcommit_memory" "$(sysctl -n vm.overcommit_memory 2>/dev/null)" "2"
+  cv_row "vm.overcommit_kbytes" "$(sysctl -n vm.overcommit_kbytes 2>/dev/null)" "$(awk '/^MemTotal/{print $2}' /proc/meminfo)"
+  cv_row "vm.swappiness" "$(sysctl -n vm.swappiness 2>/dev/null)" "1"
+  cv_row "vm.dirty_bytes" "$(sysctl -n vm.dirty_bytes 2>/dev/null)" "$((1024*1024*1024))"
+  cv_row "vm.dirty_background_bytes" "$(sysctl -n vm.dirty_background_bytes 2>/dev/null)" "$((1024*1024*1024/4))"
+  cv_row "fs.file-max" "$(sysctl -n fs.file-max 2>/dev/null)" "$((NOFILE * 4))"
+  cv_row "vm.nr_hugepages" "$(sysctl -n vm.nr_hugepages 2>/dev/null)" ""
+  cv_row "HugePages_Total / Free" "$(awk '/^HugePages_Total/{t=$2} /^HugePages_Free/{f=$2} END{print t" / "f}' /proc/meminfo)" ""
+  echo "  ※ nr_hugepages 目標值依 5.10 粗估或 7.2 精確計算而定，此處只列出不比對"
+  echo
+
+  echo "[開機調校腳本]　來源：/sys/...（由 /usr/local/sbin/edb-os-tuning.sh 開機時套用）"
+  if [ -f /etc/systemd/system/edb-os-tuning.service ]; then
+    v=$(systemctl is-enabled edb-os-tuning.service 2>/dev/null)
+  else
+    v=""
+  fi
+  cv_row "edb-os-tuning.service" "$v" "enabled"
+  cv_row "THP" "$(grep -oE '\[[a-z]+\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]')" "never"
+  root_src=$(findmnt -n -o SOURCE --target / 2>/dev/null)
+  root_dev=$(lsblk -no PKNAME "$root_src" 2>/dev/null)
+  [ -z "$root_dev" ] && root_dev=$(basename "$root_src" | sed -E 's/[0-9]+$//')
+  for dev in $(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
+    [ "$dev" = "$root_dev" ] && continue
+    [ -e "/sys/block/${dev}/queue/scheduler" ] || continue
+    rota=$(cat "/sys/block/${dev}/queue/rotational" 2>/dev/null)
+    if [ "$rota" = "0" ]; then want=none; else want=mq-deadline; fi
+    cv_row "${dev} scheduler" "$(grep -oE '\[[a-z-]+\]' "/sys/block/${dev}/queue/scheduler" 2>/dev/null | tr -d '[]')" "$want"
+    cv_row "${dev} read_ahead_kb" "$(cat "/sys/block/${dev}/queue/read_ahead_kb" 2>/dev/null)" "4096"
+  done
+  if [ -e /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+    cv_row "cpu0 scaling_governor" "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)" "performance"
+  else
+    cv_row "cpu0 scaling_governor" "（無 cpufreq 介面，常見於虛擬機）" ""
+  fi
+  if [ -e /sys/devices/system/cpu/intel_pstate/min_perf_pct ]; then
+    cv_row "intel_pstate min_perf_pct" "$(cat /sys/devices/system/cpu/intel_pstate/min_perf_pct 2>/dev/null)" "100"
+  fi
+  echo
+
+  echo "[掛載與目錄]　來源：findmnt、ls -ld"
+  for f in "$PGDATA_BASE" "$NEW_WAL"; do
+    if [ -e "$f" ]; then
+      v=$(findmnt -no OPTIONS --target "$f" 2>/dev/null | tr ',' '\n' | grep -x noatime)
+      cv_row "${f} noatime" "${v:-未設定}" "noatime"
+    else
+      cv_row "${f} noatime" "" "noatime"
+    fi
+  done
+  for f in "$NEW_PGDATA" "$NEW_WAL" "$NEW_PGLOG"; do
+    cv_row "${f} 擁有者" "$(stat -c '%U:%G' "$f" 2>/dev/null)" "enterprisedb:enterprisedb"
+  done
+  cv_row "/var/coredump 擁有者/權限" "$(stat -c '%U:%G %a' /var/coredump 2>/dev/null)" "enterprisedb:enterprisedb 750"
+  echo
+
+  echo "[EDB 套件與 systemd]　來源：rpm -q、${UNIT_DST}"
+  v=$(rpm -q "edb-as${EDB_VER}-server" 2>/dev/null) || v=""
+  cv_row "edb-as${EDB_VER}-server" "$v" ""
+  cv_row "edb-offline.repo baseurl" "$(awk -F= '/^baseurl/{print $2}' /etc/yum.repos.d/edb-offline.repo 2>/dev/null)" "file://${REPO_DIR}"
+  if [ -f "$UNIT_DST" ]; then
+    cv_row "Environment=PGDATA" "$(awk -F'PGDATA=' '/^Environment=PGDATA=/{print $2}' "$UNIT_DST")" "$NEW_PGDATA"
+    cv_row "LimitNOFILE" "$(awk -F= '/^LimitNOFILE=/{print $2}' "$UNIT_DST")" "$NOFILE"
+    cv_row "LimitNPROC" "$(awk -F= '/^LimitNPROC=/{print $2}' "$UNIT_DST")" "$NPROC"
+    cv_row "LimitCORE" "$(awk -F= '/^LimitCORE=/{print $2}' "$UNIT_DST")" "infinity"
+    cv_row "After=edb-os-tuning.service" "$(grep -qx 'After=edb-os-tuning.service' "$UNIT_DST" && echo 有)" "有"
+  else
+    cv_row "$UNIT_DST" "" ""
+  fi
+  echo
+
+  echo "[initdb 結果]　來源：pg_controldata、${NEW_PGDATA}/pg_wal"
+  if [ -f "${NEW_PGDATA}/PG_VERSION" ]; then
+    v=$(LC_ALL=C "${PG_BINDIR}/pg_controldata" "$NEW_PGDATA" 2>/dev/null | awk -F: '/Data page checksum version/{gsub(/ /,"",$2); print $2}')
+    case "$v" in 0) v=off ;; "") v="（pg_controldata 無法讀取）" ;; *) v=on ;; esac
+    cv_row "data_checksums" "$v" "on"
+    cv_row "pg_wal 指向（waldir）" "$(readlink "${NEW_PGDATA}/pg_wal" 2>/dev/null)" "$NEW_WAL"
+    if [ "$db_ok" -eq 1 ]; then
+      v=$(cv_psql "SELECT datcollate FROM pg_database WHERE datname='postgres'")
+    else
+      v="（資料庫未啟動或無法連線）"
+    fi
+    if [ "$NEED_ZH_LOCALE" = "yes" ]; then want="zh_TW.UTF-8"; else want="en_US.UTF-8"; fi
+    cv_row "locale（datcollate）" "$v" "$want" '^(en_US|zh_TW)\.(UTF-8|utf8)$'
+  else
+    cv_row "資料目錄（initdb）" "" ""
+  fi
+  echo
+
+  echo "[GUC]　來源：${NEW_PGDATA}/postgresql.auto.conf；執行中值來自 pg_settings"
+  if [ ! -f "${NEW_PGDATA}/postgresql.auto.conf" ]; then
+    cv_row "postgresql.auto.conf" "" ""
+  else
+    [ "$db_ok" -eq 1 ] || echo "  （資料庫未啟動或無法連線，只列 auto.conf 內的值）"
+    for k in "${GUC_KEYS[@]}"; do
+      v=$(cv_autoconf "$k")
+      cv_row "$k（auto.conf）" "$v" "${GUC_TGT[$k]}"
+      if [ "$db_ok" -eq 1 ]; then
+        if [ -n "${LIVE[$k]+x}" ]; then
+          printf "  %-30s   執行中 = %s%s\n" "" "${LIVE[$k]}" "$([ "${PEND[$k]}" = "t" ] && echo "　※ 已修改、待重啟生效")"
+        else
+          printf "  %-30s   執行中 = （此版本無此參數）\n" ""
+        fi
+      fi
+    done
+  fi
+  echo
+
+  echo "------------------------------------------------------"
+  printf " 一致 %d 項　不一致 %d 項　未建立/無法查詢 %d 項\n" "$CV_OK" "$CV_DIFF" "$CV_NONE"
+  echo "======================================================"
+  } 2>&1 | tee -a "$LOG_FILE"
+}
+
+# ════════════════════════════════════════════════════════════
 # 參數編輯（比照 pg_healthcheck.sh 的 edit_params()/update_config() 模式：
 # 直接在面板裡改「三、參數宣告」的值，不用跳出去手動編輯 .conf。改完立刻
 # source 設定檔＋重算衍生變數，同一次面板 session 內就會用新值。）
@@ -1523,6 +1759,7 @@ show_help() {
   echo "[T] 顯示「二、參數對比」"
   echo "[P] 參數設定（直接改「三、參數宣告」，不用跳出去編輯 .conf）"
   echo "[F] 顯示最終參數成果總覽（目前設定值＋衍生設定＋各步驟執行狀態）"
+  echo "[V] 當下值檢查（不論步驟是否執行過，讀取系統此刻的實際值並與目標值比對）"
   echo "[C] 顯示目前設定檔路徑並結束（自行編輯後重新執行本腳本即可生效）"
   echo "[H] 顯示這份說明"
   echo "[Q] 離開"
@@ -1539,7 +1776,7 @@ interactive_panel() {
   while true; do
     render_panel
     echo
-    echo "輸入代號執行單一步驟，或 [5/6/7]整章執行 [A]全部執行 [S]適用範圍 [T]參數對比 [P]參數設定 [F]最終成果 [C]設定檔路徑 [H]說明 [Q]離開"
+    echo "輸入代號執行單一步驟，或 [5/6/7]整章執行 [A]全部執行 [S]適用範圍 [T]參數對比 [P]參數設定 [F]最終成果 [V]當下值檢查 [C]設定檔路徑 [H]說明 [Q]離開"
     read -erp "> " choice
     case "$choice" in
       [qQ]) break ;;
@@ -1555,6 +1792,7 @@ interactive_panel() {
       [tT]|table) show_param_table ;;
       [pP]) edit_params ;;
       [fF]) show_final_summary ;;
+      [vV]) show_current_values ;;
       [cC]|conf) exit_msg="設定檔：${CONFIG_FILE}"; break ;;
       [hH]) show_help ;;
       *)
@@ -1582,6 +1820,9 @@ case "${1:-}" in
   --run-all)
     run_all
     ;;
+  --check)
+    show_current_values
+    ;;
   "")
     interactive_panel
     ;;
@@ -1589,7 +1830,7 @@ case "${1:-}" in
     if [ -n "${STEP_FUNC[$1]:-}" ]; then
       run_step "$1"
     else
-      echo "用法：$0 [--run-all | 步驟代號，例如 5.7]"
+      echo "用法：$0 [--run-all | --check | 步驟代號，例如 5.7]"
       exit 1
     fi
     ;;
