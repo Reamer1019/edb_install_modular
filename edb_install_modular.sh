@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# edb_os_check.sh — EDB Postgres Advanced Server 標準安裝程序（模組化版）
+# edb_install_modular.sh — EDB Postgres Advanced Server 標準安裝程序（模組化版）
 #
 # 本文件以「確保安裝結果 100% 可用」為唯一撰寫原則，不將安全等非必要考量納入範圍。
 #
@@ -28,9 +28,9 @@
 #     offline repo。
 #
 # 用法：
-#   ./edb_os_check.sh            # 進入互動面板
-#   ./edb_os_check.sh --run-all  # 非互動，依序跑完全部步驟
-#   ./edb_os_check.sh 5.7        # 非互動，只跑單一步驟後結束
+#   ./edb_install_modular.sh            # 進入互動面板
+#   ./edb_install_modular.sh --run-all  # 非互動，依序跑完全部步驟
+#   ./edb_install_modular.sh 5.7        # 非互動，只跑單一步驟後結束
 #
 set -uo pipefail
 
@@ -48,7 +48,7 @@ LOG_FILE="$LOG_DIR/$(date '+%Y%m%d_%H%M%S').log"
 create_default_config() {
   cat > "$CONFIG_FILE" <<'EOF'
 # ────────────────────────────────────────
-# edb_os_check.sh 設定檔（對應原文件「三、參數宣告」）
+# edb_install_modular.sh 設定檔（對應原文件「三、參數宣告」）
 #
 # 以下除 listen_addresses 因應本文件之連線需求刻意偏離官方預設值外，
 # 其餘均採用 PG/EDB 官方預設值。改完存檔，下次執行就會生效。

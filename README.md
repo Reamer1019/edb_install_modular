@@ -1,4 +1,4 @@
-# edb_os_check.sh
+# edb_install_modular.sh
 
 EDB Postgres Advanced Server 標準安裝程序的模組化版本。把原本線性、由上而下執行一次的安裝文件，改寫成可以「單一步驟獨立選取執行」的互動式文字面板，每個步驟對應原文件的一個編號小節，可以單獨重跑、整章跑，也可以一次全部跑完。
 
@@ -20,9 +20,9 @@ EDB Postgres Advanced Server 標準安裝程序的模組化版本。把原本線
 ## 用法
 
 ```bash
-./edb_os_check.sh            # 進入互動面板
-./edb_os_check.sh --run-all  # 非互動，依序跑完全部步驟（五 → 六 → 七）
-./edb_os_check.sh 5.7        # 非互動，只跑單一步驟後結束（步驟代號見下表）
+./edb_install_modular.sh            # 進入互動面板
+./edb_install_modular.sh --run-all  # 非互動，依序跑完全部步驟（五 → 六 → 七）
+./edb_install_modular.sh 5.7        # 非互動，只跑單一步驟後結束（步驟代號見下表）
 ```
 
 第一次執行會在腳本所在目錄自動產生設定檔 `edb_install.conf`（若已存在則直接讀取，不會覆蓋），改設定不需要改程式碼，改完存檔、下次執行即生效。
