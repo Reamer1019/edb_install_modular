@@ -79,6 +79,10 @@ SHARED_BUFFERS="4GB"          # <-- Edit this line
 MAX_PREPARED_TRANSACTIONS="0" # <-- Edit this line
 MAX_REPLICATION_SLOTS="10"    # <-- Edit this line
 HUGE_PAGES="try"              # <-- Edit this line
+# SHARED_PRELOAD_LIBRARIES：「額外」要預載的函式庫，逗號分隔，例如 "pg_stat_statements"。
+#   留空＝不寫入 auto.conf，沿用 initdb 產生的 postgresql.conf 預設值（各 EPAS 版本不同）。
+#   有填值時，6.6 會先讀 postgresql.conf 原本的值，再把這裡的值合併、去重後寫入，
+#   不需要自己填版本預設的函式庫。
 SHARED_PRELOAD_LIBRARIES=""   # <-- Edit this line
 
 # REMOTE_HOSTS：standby/witness 主機清單，格式 "IP 主機名稱"，一行一台
@@ -460,7 +464,7 @@ EOF
     return 1
   fi
   sysctl --system || { echo -e "  ${C_RED}[CRIT]${C_RST} sysctl --system 套用失敗" >&2; return 1; }
-  echo -e "  ${C_GRN}[OK]${C_RST} core_pattern 已設定（存放目錄權限見 7.3）"
+  echo -e "  ${C_GRN}[OK]${C_RST} core_pattern 已設定（存放目錄權限見 7.2）"
 }
 
 # 5.9 sysctl：記憶體 overcommit 與 dirty memory
@@ -497,7 +501,7 @@ EOF
   echo -e "  ${C_GRN}[OK]${C_RST} 已寫入 /etc/sysctl.d/80-edb-postgres.conf（MEM_OVERCOMMIT 區塊）並套用"
 }
 
-# 5.10 Hugepage 設定（粗估值，EDB 安裝後由 7.2 校正為精確值）
+# 5.10 Hugepage 設定（粗估值，EDB 安裝後由 7.1 校正為精確值）
 # 參考：
 #   https://www.postgresql.org/docs/current/kernel-resources.html#LINUX-HUGE-PAGES
 #   https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-HUGE-PAGES
@@ -506,7 +510,7 @@ EOF
 # THP 停用理論上該寫在這裡，但已併入 5.11 的開機腳本一起處理（官方文件指出
 # 部分 Linux 版本上 THP 會造成效能下降，不建議使用）。
 # nr_hugepages 這一行寫進與 5.8/5.9 共用的 80-edb-postgres.conf，同樣用
-# write_managed_block 認領獨立 marker，7.2 的精確值日後覆蓋也走同一個
+# write_managed_block 認領獨立 marker，7.1 的精確值日後覆蓋也走同一個
 # marker，彼此任意順序執行都不會互相打架。
 step_5_10_hugepage_estimate() {
   require_root || return 1
@@ -524,7 +528,7 @@ step_5_10_hugepage_estimate() {
     echo -e "  ${C_RED}[CRIT]${C_RST} 寫入 NR_HUGEPAGES 區塊失敗" >&2
     return 1
   }
-  echo -e "  ${C_GRN}[OK]${C_RST} 粗估值已套用，EDB 安裝完成後請執行 7.2 校正為精確值"
+  echo -e "  ${C_GRN}[OK]${C_RST} 粗估值已套用，EDB 安裝完成後請執行 7.1 校正為精確值"
 }
 
 # 5.11 I/O Scheduler 與 Readahead
@@ -767,7 +771,7 @@ step_6_5_run_initdb() {
     echo -e "  ${C_RED}[CRIT]${C_RST} initdb 失敗，請檢查上方輸出訊息" >&2
     return 1
   fi
-  echo -e "  ${C_GRN}[OK]${C_RST} initdb 完成（尚未啟動 service，待 6.6 GUC 寫入、7.2 hugepage 校正後再啟動）"
+  echo -e "  ${C_GRN}[OK]${C_RST} initdb 完成（尚未啟動 service，待 6.6 GUC 寫入、7.1 hugepage 校正後再啟動）"
 }
 
 # 6.6 GUC 寫入
@@ -777,85 +781,104 @@ step_6_5_run_initdb() {
 # 作法應在檔案已存在時比對內容（相同回傳成功、不同才回傳失敗），但官方範例
 # 本身只要檔案存在就一律回傳非 0，不比對內容——這是官方文件自陳的範例限制，
 # 非本文件疏漏。
-# 編號排在 initdb（6.5）之後：initdb 完成時會自動產生一份內容為空的
-# postgresql.auto.conf，這裡是對已存在的檔案追加寫入，不會讓 initdb 因為
-# 目錄非空而失敗（詳見 6.5 註解）。
+# spl_base：initdb 產生的 postgresql.conf 裡 shared_preload_libraries 的值。
+# 各 EPAS 版本預設載入的函式庫不同（例如 EPAS 18 為
+# $libdir/dbms_pipe,$libdir/edb_gen,$libdir/dbms_aq），一律以實際檔案為準，不寫死。
+spl_base() {
+  grep -E "^[[:space:]]*shared_preload_libraries[[:space:]]*=" "${NEW_PGDATA}/postgresql.conf" 2>/dev/null | tail -n1 |
+    sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^'//; s/'$//"
+}
+
+# spl_merge：版本預設值＋SHARED_PRELOAD_LIBRARIES，依序合併並去重
+# （比對時忽略 $libdir/ 前綴，所以 dbms_pipe 與 $libdir/dbms_pipe 視為同一個）
+spl_merge() {
+  local item key out="" all
+  local -a arr
+  local -A seen=()
+  all="$(spl_base),${SHARED_PRELOAD_LIBRARIES}"
+  IFS=',' read -ra arr <<< "$all"
+  for item in "${arr[@]}"; do
+    item="${item//[[:space:]]/}"
+    [ -n "$item" ] || continue
+    key="${item#\$libdir/}"
+    [ -n "${seen[$key]+x}" ] && continue
+    seen[$key]=1
+    out+="${out:+,}${item}"
+  done
+  printf '%s' "$out"
+}
+
+# 編號排在 initdb（6.5）之後：initdb 完成時會自動產生 postgresql.auto.conf，
+# 這裡是對已存在的檔案寫入，不會讓 initdb 因為目錄非空而失敗（詳見 6.5 註解）。
+# 可重複執行：寫入前先刪掉本步驟管理的每個參數既有的設定行，再重新寫入，
+# 重跑幾次結果都一樣，不會在 auto.conf 留下重複的設定。
 # 本文件不設定 WAL 歸檔（archive_mode / archive_command 維持官方預設值 off / ''），
 # 歸檔由日後導入的備份工具（Barman / pgBackRest）負責設定。
 # 注意：archive_mode 變更需重啟資料庫才會生效。
 step_6_6_guc_write() {
   require_root || return 1
   echo "== [6.6] GUC 寫入 =="
-  if [ ! -d "$NEW_PGDATA" ]; then
-    echo -e "  ${C_RED}[CRIT]${C_RST} $NEW_PGDATA 不存在，請確認 6.2/6.5 是否已完成。" >&2
+  local autoconf="${NEW_PGDATA}/postgresql.auto.conf" line key spl
+  if [ ! -f "$autoconf" ]; then
+    echo -e "  ${C_RED}[CRIT]${C_RST} $autoconf 不存在，請確認 6.5 initdb 是否已完成。" >&2
     return 1
   fi
-  cat >> "${NEW_PGDATA}/postgresql.auto.conf" << EOF
-listen_addresses = '${LISTEN_ADDRESSES}'
-port = ${PORT}
-shared_buffers = ${SHARED_BUFFERS}
-max_connections = ${MAX_CONNECTIONS}
-max_worker_processes = ${MAX_WORKER_PROCESSES}
-autovacuum_worker_slots = ${AUTOVACUUM_WORKER_SLOTS}
-max_files_per_process = ${MAX_FILES_PER_PROCESS}
-max_prepared_transactions = ${MAX_PREPARED_TRANSACTIONS}
-max_wal_senders = ${MAX_WAL_SENDERS}
-max_replication_slots = ${MAX_REPLICATION_SLOTS}
-huge_pages = ${HUGE_PAGES}
-shared_preload_libraries = '${SHARED_PRELOAD_LIBRARIES}'
-log_directory = '${NEW_PGLOG}'
-logging_collector = on
-EOF
-  if [ $? -ne 0 ]; then
-    echo -e "  ${C_RED}[CRIT]${C_RST} 寫入 ${NEW_PGDATA}/postgresql.auto.conf 失敗" >&2
-    return 1
+
+  local -a guc_lines=(
+    "listen_addresses = '${LISTEN_ADDRESSES}'"
+    "port = ${PORT}"
+    "shared_buffers = ${SHARED_BUFFERS}"
+    "max_connections = ${MAX_CONNECTIONS}"
+    "max_worker_processes = ${MAX_WORKER_PROCESSES}"
+    "autovacuum_worker_slots = ${AUTOVACUUM_WORKER_SLOTS}"
+    "max_files_per_process = ${MAX_FILES_PER_PROCESS}"
+    "max_prepared_transactions = ${MAX_PREPARED_TRANSACTIONS}"
+    "max_wal_senders = ${MAX_WAL_SENDERS}"
+    "max_replication_slots = ${MAX_REPLICATION_SLOTS}"
+    "huge_pages = ${HUGE_PAGES}"
+    "log_directory = '${NEW_PGLOG}'"
+    "logging_collector = on"
+  )
+  # shared_preload_libraries：auto.conf 的值會整個取代 postgresql.conf 的值，
+  # 留空時不寫入（避免蓋掉版本預設載入的函式庫）；有填值時與版本預設值合併後寫入。
+  # spl_merge 讀的是 postgresql.conf，不是 auto.conf，所以重跑也不會重複合併。
+  if [ -n "$SHARED_PRELOAD_LIBRARIES" ]; then
+    spl=$(spl_merge)
+    guc_lines+=("shared_preload_libraries = '${spl}'")
   fi
-  echo -e "  ${C_GRN}[OK]${C_RST} GUC 已寫入 ${NEW_PGDATA}/postgresql.auto.conf"
+
+  # 先刪除本步驟管理的參數既有的設定行（shared_preload_libraries 一律刪，
+  # 留空時等於移除先前寫入的值，回到 postgresql.conf 預設）
+  for key in $(printf '%s\n' "${guc_lines[@]}" | awk '{print $1}') shared_preload_libraries; do
+    sed -i "/^[[:space:]]*${key}[[:space:]]*=/d" "$autoconf" || {
+      echo -e "  ${C_RED}[CRIT]${C_RST} 清除 ${autoconf} 中既有的 ${key} 設定失敗" >&2
+      return 1
+    }
+  done
+
+  printf '%s\n' "${guc_lines[@]}" >> "$autoconf" || {
+    echo -e "  ${C_RED}[CRIT]${C_RST} 寫入 ${autoconf} 失敗" >&2
+    return 1
+  }
+
+  if [ -n "$SHARED_PRELOAD_LIBRARIES" ]; then
+    echo "  shared_preload_libraries：postgresql.conf 原值（$(spl_base)）＋額外（${SHARED_PRELOAD_LIBRARIES}）"
+    echo "    → 合併後寫入：${spl}"
+  else
+    echo "  SHARED_PRELOAD_LIBRARIES 為空，不寫入 shared_preload_libraries，沿用 postgresql.conf 預設值（$(spl_base)）。"
+  fi
+  echo -e "  ${C_GRN}[OK]${C_RST} GUC 已寫入 ${autoconf}（既有的同名設定已先清除，可重複執行）"
 }
 
 # ════════════════════════════════════════════════════════════
 # 七、EDB 安裝後的 OS 設定
 # ════════════════════════════════════════════════════════════
 
-# 7.1 SSH 金鑰交換
-step_7_1_ssh_keys() {
-  require_root || return 1
-  echo "== [7.1] SSH 金鑰交換 =="
-  for ENTRY in "${REMOTE_HOSTS[@]}"; do
-    grep -qF "$ENTRY" /etc/hosts || echo "$ENTRY" >> /etc/hosts
-  done
-
-  # su 這個 heredoc 裡串了 keygen + 每一台的 ssh-copy-id，殼層回傳的是「最後
-  # 一個指令」（也就是最後一台的 ssh-copy-id）的結束碼，只能反映最後一台是否
-  # 成功；只要有任何一台失敗，畫面上都會印出對應的錯誤訊息，仍請往上捲確認
-  # 是否每一台都真的成功，不能只看最終狀態。
-  if ! su - enterprisedb << EOF
-
-if [ ! -f ~/.ssh/id_rsa ]; then
-	mkdir -p ~/.ssh
-	chmod 700 ~/.ssh
-	ssh-keygen -t rsa -b 4096 -N '' -f ~/.ssh/id_rsa
-fi
-chmod 600 ~/.ssh/id_rsa
-chmod 644 ~/.ssh/id_rsa.pub
-
-$(for ENTRY in "${REMOTE_HOSTS[@]}"; do
-NAME=$(awk '{print $2}' <<< "$ENTRY")
-echo "ssh-copy-id -o StrictHostKeyChecking=accept-new enterprisedb@${NAME}"
-done)
-EOF
-  then
-    echo -e "  ${C_RED}[CRIT]${C_RST} SSH 金鑰交換過程中至少最後一步失敗，請往上捲確認每一台 ssh-copy-id 的結果" >&2
-    return 1
-  fi
-  echo -e "  ${C_GRN}[OK]${C_RST} SSH 金鑰交換完成"
-}
-
-# 7.2 Hugepage 精確設定
+# 7.1 Hugepage 精確設定
 # 用 EDB 自己的 shared_memory_size_in_huge_pages 算出精確值，取代 5.10 的粗估。
-step_7_2_hugepage_precise() {
+step_7_1_hugepage_precise() {
   require_root || return 1
-  echo "== [7.2] Hugepage 精確設定 =="
+  echo "== [7.1] Hugepage 精確設定 =="
   local SCRATCH_PGDATA NR ENGINE_BINDIR PG_ENGINE
 
   # 不寫死 ${PG_BINDIR}/postgres：已實測確認 EPAS 18（/usr/edb/as18/bin）底下
@@ -952,14 +975,48 @@ EOF
   echo -e "  ${C_GRN}[OK]${C_RST} 精確值 nr_hugepages=${NR} 已套用並重啟服務（使用執行檔：${PG_ENGINE}）"
 }
 
-# 7.3 Core Dump 更改權限
-step_7_3_coredump_perm() {
+# 7.2 Core Dump 更改權限
+step_7_2_coredump_perm() {
   require_root || return 1
-  echo "== [7.3] Core Dump 更改權限 =="
+  echo "== [7.2] Core Dump 更改權限 =="
   mkdir -p /var/coredump || { echo -e "  ${C_RED}[CRIT]${C_RST} mkdir /var/coredump 失敗" >&2; return 1; }
   chown enterprisedb:enterprisedb /var/coredump || { echo -e "  ${C_RED}[CRIT]${C_RST} chown /var/coredump 失敗（enterprisedb 使用者是否已由 6.1 套件安裝建立？）" >&2; return 1; }
   chmod 750 /var/coredump || { echo -e "  ${C_RED}[CRIT]${C_RST} chmod /var/coredump 失敗" >&2; return 1; }
   echo -e "  ${C_GRN}[OK]${C_RST} /var/coredump 權限已設定"
+}
+
+# 7.3 SSH 金鑰交換
+step_7_3_ssh_keys() {
+  require_root || return 1
+  echo "== [7.3] SSH 金鑰交換 =="
+  for ENTRY in "${REMOTE_HOSTS[@]}"; do
+    grep -qF "$ENTRY" /etc/hosts || echo "$ENTRY" >> /etc/hosts
+  done
+
+  # su 這個 heredoc 裡串了 keygen + 每一台的 ssh-copy-id，殼層回傳的是「最後
+  # 一個指令」（也就是最後一台的 ssh-copy-id）的結束碼，只能反映最後一台是否
+  # 成功；只要有任何一台失敗，畫面上都會印出對應的錯誤訊息，仍請往上捲確認
+  # 是否每一台都真的成功，不能只看最終狀態。
+  if ! su - enterprisedb << EOF
+
+if [ ! -f ~/.ssh/id_rsa ]; then
+	mkdir -p ~/.ssh
+	chmod 700 ~/.ssh
+	ssh-keygen -t rsa -b 4096 -N '' -f ~/.ssh/id_rsa
+fi
+chmod 600 ~/.ssh/id_rsa
+chmod 644 ~/.ssh/id_rsa.pub
+
+$(for ENTRY in "${REMOTE_HOSTS[@]}"; do
+NAME=$(awk '{print $2}' <<< "$ENTRY")
+echo "ssh-copy-id -o StrictHostKeyChecking=accept-new enterprisedb@${NAME}"
+done)
+EOF
+  then
+    echo -e "  ${C_RED}[CRIT]${C_RST} SSH 金鑰交換過程中至少最後一步失敗，請往上捲確認每一台 ssh-copy-id 的結果" >&2
+    return 1
+  fi
+  echo -e "  ${C_GRN}[OK]${C_RST} SSH 金鑰交換完成"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -986,9 +1043,9 @@ declare -A STEP_TITLE=(
   [6.4]="initdb 參數設定"
   [6.5]="執行 initdb"
   [6.6]="GUC 寫入"
-  [7.1]="SSH 金鑰交換"
-  [7.2]="Hugepage 精確設定"
-  [7.3]="Core Dump 更改權限"
+  [7.1]="Hugepage 精確設定"
+  [7.2]="Core Dump 更改權限"
+  [7.3]="SSH 金鑰交換"
 )
 declare -A STEP_FUNC=(
   [5.1]=step_5_1_check_pgdata_mount
@@ -1010,9 +1067,9 @@ declare -A STEP_FUNC=(
   [6.4]=step_6_4_initdb_params
   [6.5]=step_6_5_run_initdb
   [6.6]=step_6_6_guc_write
-  [7.1]=step_7_1_ssh_keys
-  [7.2]=step_7_2_hugepage_precise
-  [7.3]=step_7_3_coredump_perm
+  [7.1]=step_7_1_hugepage_precise
+  [7.2]=step_7_2_coredump_perm
+  [7.3]=step_7_3_ssh_keys
 )
 declare -A STEP_CHAPTER=(
   [5.1]="五、作業系統設定" [5.2]="五、作業系統設定" [5.3]="五、作業系統設定"
@@ -1132,6 +1189,9 @@ show_param_table() {
   waldir            : PGDATA/pg_wal -> ${NEW_WAL}
   log_directory     : log -> ${NEW_PGLOG}
   logging_collector : off -> on
+  shared_preload_libraries : 依 EPAS 版本預設（initdb 產生的 postgresql.conf，
+                             例如 EPAS 18 為 $libdir/dbms_pipe,$libdir/edb_gen,$libdir/dbms_aq）
+                             -> 留空時不變；有填 SHARED_PRELOAD_LIBRARIES 時為「版本預設＋額外值」
 EOF
 }
 
@@ -1206,13 +1266,13 @@ show_final_summary() {
     echo
   fi
 
-  if step_is_done 5.10 || step_is_done 7.2; then
-    echo "[5.10/7.2] Hugepage（vm.nr_hugepages，5.10 粗估、7.2 校正為精確值，共用同一設定區塊）"
+  if step_is_done 5.10 || step_is_done 7.1; then
+    echo "[5.10/7.1] Hugepage（vm.nr_hugepages，5.10 粗估、7.1 校正為精確值，共用同一設定區塊）"
     printf "  目前生效值（sysctl）      = %s\n" "$(sysctl -n vm.nr_hugepages 2>/dev/null || echo 未知)"
-    local t510 t72 last
-    t510=$(state_get 5.10); t72=$(state_get 7.2)
-    if [ -n "$t72" ] && { [ -z "$t510" ] || [ "${t72%% *}" -ge "${t510%% *}" ]; }; then
-      last="7.2（精確值）"
+    local t510 t71 last
+    t510=$(state_get 5.10); t71=$(state_get 7.1)
+    if [ -n "$t71" ] && { [ -z "$t510" ] || [ "${t71%% *}" -ge "${t510%% *}" ]; }; then
+      last="7.1（精確值）"
     else
       last="5.10（粗估值）"
     fi
@@ -1294,20 +1354,20 @@ show_final_summary() {
     echo
   fi
 
-  if step_is_done 7.1; then
-    echo "[7.1] SSH 金鑰交換"
+  if step_is_done 7.2; then
+    echo "[7.2] Core Dump 目錄權限"
+    ls -ld /var/coredump 2>/dev/null | sed 's/^/  /' || echo "  找不到 /var/coredump"
+    echo "  來源：/var/coredump（chown/chmod 直接作用於目錄，無額外設定檔）"
+    echo
+  fi
+
+  if step_is_done 7.3; then
+    echo "[7.3] SSH 金鑰交換"
     local h
     for h in "${REMOTE_HOSTS[@]}"; do
       echo "  - $h"
     done
     echo "  來源：/etc/hosts（本機端寫入）；各 standby/witness 主機的 ~enterprisedb/.ssh/authorized_keys 需至對方主機確認"
-    echo
-  fi
-
-  if step_is_done 7.3; then
-    echo "[7.3] Core Dump 目錄權限"
-    ls -ld /var/coredump 2>/dev/null | sed 's/^/  /' || echo "  找不到 /var/coredump"
-    echo "  來源：/var/coredump（chown/chmod 直接作用於目錄，無額外設定檔）"
     echo
   fi
 
@@ -1423,7 +1483,7 @@ show_current_values() {
     [autovacuum_worker_slots]="$AUTOVACUUM_WORKER_SLOTS" [max_files_per_process]="$MAX_FILES_PER_PROCESS"
     [max_prepared_transactions]="$MAX_PREPARED_TRANSACTIONS" [max_wal_senders]="$MAX_WAL_SENDERS"
     [max_replication_slots]="$MAX_REPLICATION_SLOTS" [huge_pages]="$HUGE_PAGES"
-    [shared_preload_libraries]="$SHARED_PRELOAD_LIBRARIES" [log_directory]="$NEW_PGLOG"
+    [shared_preload_libraries]="" [log_directory]="$NEW_PGLOG"
     [logging_collector]="on"
   )
 
@@ -1487,9 +1547,9 @@ show_current_values() {
   cv_item "5.9" "vm.dirty_background_bytes" "$SYSCTL_SRC" \
     "$(sysctl -n vm.dirty_background_bytes 2>/dev/null)" "$((1024*1024*1024/4))"
   cv_item "5.9" "fs.file-max" "$SYSCTL_SRC" "$(sysctl -n fs.file-max 2>/dev/null)" "$((NOFILE * 4))"
-  cv_item "5.10/7.2" "vm.nr_hugepages" "$SYSCTL_SRC" "$(sysctl -n vm.nr_hugepages 2>/dev/null)" ""
-  cv_note "目標值依 5.10 粗估或 7.2 精確計算而定，此處只列出不比對"
-  cv_item "5.10/7.2" "HugePages_Total / Free" "/proc/meminfo" \
+  cv_item "5.10/7.1" "vm.nr_hugepages" "$SYSCTL_SRC" "$(sysctl -n vm.nr_hugepages 2>/dev/null)" ""
+  cv_note "目標值依 5.10 粗估或 7.1 精確計算而定，此處只列出不比對"
+  cv_item "5.10/7.1" "HugePages_Total / Free" "/proc/meminfo" \
     "$(awk '/^HugePages_Total/{t=$2} /^HugePages_Free/{f=$2} END{print t" / "f}' /proc/meminfo)" ""
 
   # 開機調校腳本
@@ -1538,7 +1598,7 @@ show_current_values() {
   for f in "$NEW_PGDATA" "$NEW_WAL" "$NEW_PGLOG"; do
     cv_item "6.2" "${f} 擁有者" "stat -c %U:%G" "$(stat -c '%U:%G' "$f" 2>/dev/null)" "enterprisedb:enterprisedb"
   done
-  cv_item "7.3" "/var/coredump 擁有者/權限" "stat -c '%U:%G %a'" \
+  cv_item "7.2" "/var/coredump 擁有者/權限" "stat -c '%U:%G %a'" \
     "$(stat -c '%U:%G %a' /var/coredump 2>/dev/null)" "enterprisedb:enterprisedb 750"
 
   # EDB 套件與 systemd unit
@@ -1590,6 +1650,18 @@ show_current_values() {
         fi
       else
         extra="執行中：無法查詢（資料庫未啟動或無法連線）"
+      fi
+      if [ "$k" = "shared_preload_libraries" ]; then
+        if [ -z "$SHARED_PRELOAD_LIBRARIES" ]; then
+          # 留空＝刻意不寫入 auto.conf，列出 postgresql.conf 的版本預設值，只列出不比對
+          cv_item "6.6" "$k" "${NEW_PGDATA}/postgresql.conf（未寫入 auto.conf）；執行中值來自 pg_settings" \
+            "$(spl_base)" "" "" "$extra"
+        else
+          # 有填值＝目標為「版本預設值＋額外值」合併去重後的結果
+          cv_item "6.6" "$k" "$AUTOCONF（版本預設值＋SHARED_PRELOAD_LIBRARIES）；執行中值來自 pg_settings" \
+            "$(cv_autoconf "$k")" "$(spl_merge)" "" "$extra"
+        fi
+        continue
       fi
       cv_item "6.6" "$k" "$AUTOCONF；執行中值來自 pg_settings" \
         "$(cv_autoconf "$k")" "${GUC_TGT[$k]}" "" "$extra"
@@ -1646,7 +1718,7 @@ edit_remote_hosts() {
   local choice entry new_list i
   while true; do
     clear 2>/dev/null || true
-    echo "== REMOTE_HOSTS（standby/witness 主機清單，7.1 SSH 金鑰交換用）=="
+    echo "== REMOTE_HOSTS（standby/witness 主機清單，7.3 SSH 金鑰交換用）=="
     for i in "${!REMOTE_HOSTS[@]}"; do
       echo "  [$((i+1))] ${REMOTE_HOSTS[$i]}"
     done

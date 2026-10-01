@@ -61,8 +61,9 @@ EDB Postgres Advanced Server 標準安裝程序的模組化版本。把原本線
 | `ISO_MOUNT_DIR` | 本機安裝 ISO 掛載路徑（5.4 用，預設 `/mnt`） |
 | `MAX_CONNECTIONS` / `MAX_WORKER_PROCESSES` / `AUTOVACUUM_WORKER_SLOTS` / `MAX_WAL_SENDERS` / `MAX_FILES_PER_PROCESS` | 用於推算 ulimit（5.7）與 sysctl（5.9）數值，以及寫入 GUC（6.6） |
 | `PGDATA_BASE` | 資料庫資料目錄的根路徑 |
-| `LISTEN_ADDRESSES` / `PORT` / `SHARED_BUFFERS` / `MAX_PREPARED_TRANSACTIONS` / `MAX_REPLICATION_SLOTS` / `HUGE_PAGES` / `SHARED_PRELOAD_LIBRARIES` | 寫入 `postgresql.auto.conf` 的 GUC 值 |
-| `REMOTE_HOSTS` | standby/witness 主機清單（`"IP 主機名稱"`，一行一台），7.1 SSH 金鑰交換用 |
+| `LISTEN_ADDRESSES` / `PORT` / `SHARED_BUFFERS` / `MAX_PREPARED_TRANSACTIONS` / `MAX_REPLICATION_SLOTS` / `HUGE_PAGES` | 寫入 `postgresql.auto.conf` 的 GUC 值 |
+| `SHARED_PRELOAD_LIBRARIES` | 「額外」要預載的函式庫。留空時不寫入，沿用 initdb 產生的 postgresql.conf 預設值（各 EPAS 版本不同，例如 EPAS 18 為 `$libdir/dbms_pipe,$libdir/edb_gen,$libdir/dbms_aq`）；有填值時，6.6 會自動與版本預設值合併、去重後寫入 `postgresql.auto.conf` |
+| `REMOTE_HOSTS` | standby/witness 主機清單（`"IP 主機名稱"`，一行一台），7.3 SSH 金鑰交換用 |
 
 ## 步驟總覽
 
@@ -79,7 +80,7 @@ EDB Postgres Advanced Server 標準安裝程序的模組化版本。把原本線
 | 5.7 | ulimit（NOFILE/NPROC） | |
 | 5.8 | Core Dump 設定 | 與 5.9、5.10 共用 `/etc/sysctl.d/80-edb-postgres.conf` |
 | 5.9 | sysctl：記憶體 overcommit 與 dirty memory | 與 5.8、5.10 共用同一設定檔 |
-| 5.10 | Hugepage 設定（粗估值） | 與 5.8、5.9 共用同一設定檔；精確值由 7.2 校正 |
+| 5.10 | Hugepage 設定（粗估值） | 與 5.8、5.9 共用同一設定檔；精確值由 7.1 校正 |
 | 5.11 | I/O Scheduler 與 Readahead | 與 5.12 共用 `edb-os-tuning.sh`／`edb-os-tuning.service` |
 | 5.12 | CPU 效能模式（Governor）設定 | 與 5.11 共用同一開機腳本 |
 | 5.13 | atime（PGDATA_BASE） | |
@@ -105,9 +106,9 @@ EDB Postgres Advanced Server 標準安裝程序的模組化版本。把原本線
 
 | 代號 | 步驟 |
 |---|---|
-| 7.1 | SSH 金鑰交換（standby/witness） |
-| 7.2 | Hugepage 精確設定（校正 5.10 的粗估值） |
-| 7.3 | Core Dump 更改權限 |
+| 7.1 | Hugepage 精確設定（校正 5.10 的粗估值） |
+| 7.2 | Core Dump 更改權限 |
+| 7.3 | SSH 金鑰交換（standby/witness） |
 
 ## 設計說明
 
